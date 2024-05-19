@@ -1,0 +1,82 @@
+name: Run smoke tests on APT packages
+on:
+  push
+
+jobs:
+  test-apt-packages:
+    name: ${{ matrix.distro }}
+    strategy:
+      matrix:
+        distro:
+          - "debian:bullseye"
+          - "debian:bookworm"
+          - "debian:testing"
+          - "debian:sid"
+          - "ubuntu:focal"
+          - "ubuntu:jammy"
+          - "ubuntu:noble"
+          - "ubuntu:lunar"
+          - "ubuntu:mantic"
+        upgrade-from:
+          - "debian-official"
+          - "axosyslog-last"
+        exclude:
+          # The official syslog-ng got removed from debian:testing because of pcre:
+          # https://tracker.debian.org/news/1445295/syslog-ng-removed-from-testing/
+          - distro: "debian:testing"
+            upgrade-from: "debian-official"
+      fail-fast: false
+    runs-on: ubuntu-latest
+    container: ${{ matrix.distro }}
+    steps:
+      - name: Install prerequisites for adding 3rd party repository
+        run: |
+          apt-get update -qq
+          apt-get install --yes wget gnupg2 ca-certificates apt-transport-https
+
+      - name: Install the Debian official syslog-ng OSE package
+        if: matrix.upgrade-from == 'debian-official'
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes syslog-ng
+
+      - name: Add OSE repository
+        run: |
+          wget -O alltilla-pub.asc https://pkg.axosyslog.alltilla.com/alltilla-pub.asc
+          cat alltilla-pub.asc | gpg --dearmor > /usr/share/keyrings/axosyslog-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/axosyslog-archive-keyring.gpg] https://pkg.axosyslog.alltilla.com/apt nightly $(echo ${{ matrix.distro }} | sed 's/:/-/g')" | tee --append /etc/apt/sources.list.d/syslog-ng-ose.list
+          apt-get update -qq
+
+      - name: Install the last but one AxoSyslog package
+        if: matrix.upgrade-from == 'axosyslog-last'
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes axosyslog=$(apt-cache madison axosyslog | sed -n 2p | awk -F"|" '{print $2}' | sed 's/ //g')
+
+      - name: Upgrade to the latest AxoSyslog package
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes axosyslog
+
+      - name: Get syslog-ng revision
+        run: |
+          syslog-ng -V
+          echo "REVISION=$(syslog-ng -V | grep Revision | cut -d" " -f2)" >> $GITHUB_OUTPUT
+        id: syslog_ng_revision
+
+      - name: Check revision
+        run: |
+          if [ "nightly" = "nightly" ]; then
+            echo "${{ steps.syslog_ng_revision.outputs.REVISION }}" | egrep "^[0-9]{1}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]{1,3}\.[a-z0-9]{8})?-snapshot\+[0-9]{8}T[0-9]{6}$"
+          elif [ "nightly" = "stable" ]; then
+            echo "${{ steps.syslog_ng_revision.outputs.REVISION }}" | egrep "^[0-9]{1}\.[0-9]{1,2}\.[0-9]{1,2}-[0-9]{1,2}$"
+          fi
+
+      - name: Check if installed package version matches with install revision
+        run: |
+          echo "Installed revision value: ${{ steps.syslog_ng_revision.outputs.REVISION }}"
+          dpkg-query --show axosyslog\*
+          dpkg-query -f='${db:Status-Status}\t${package}\t${version}\t\n' --show axosyslog\* | grep ^installed | while read installed_axosyslog_package ; do echo $installed_axosyslog_package | grep ${{ steps.syslog_ng_revision.outputs.REVISION }} ; done
+
+      - name: Check if syslog-ng can start with default config
+        run: |
+          nohup syslog-ng -Fe &
+          sleep 5
+          syslog-ng-ctl stop
